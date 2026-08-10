@@ -40,6 +40,7 @@
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
@@ -62,6 +63,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <Eigen/Geometry>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -86,6 +88,9 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+
+string world_frame = "odom";
+string body_frame = "body";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -137,6 +142,7 @@ vect3 pos_lid;
 
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
+nav_msgs::msg::Odometry odomNav;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
@@ -505,7 +511,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = world_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
@@ -513,7 +519,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    /*
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -540,7 +545,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -557,7 +561,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = body_frame;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -574,7 +578,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = world_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -596,13 +600,13 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
     // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = world_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
 
     // sensor_msgs::msg::PointCloud2 laserCloudMap;
     // pcl::toROSMsg(*featsFromMap, laserCloudMap);
     // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
+    // laserCloudMap.header.frame_id = world_frame;
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
@@ -627,15 +631,61 @@ void set_posestamp(T & out)
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped = nav_msgs::msg::Odometry();
+    
+    odomAftMapped.header.frame_id = world_frame;
+    odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+    
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
-    auto P = kf.get_P();
+    
+    const Eigen::Vector3d velocity_odom(
+    	state_point.vel(0),
+    	state_point.vel(1),
+    	state_point.vel(2));
+    
+    const Eigen::Matrix3d rotation_odom_body =
+    	state_point.rot.toRotationMatrix();
+    	
+    const Eigen::Vector3d velocity_body =
+    	rotation_odom_body.transpose() * velocity_odom;
+    	
+    odomAftMapped.twist.twist.linear.x = velocity_body.x();
+    odomAftMapped.twist.twist.linear.y = velocity_body.y();
+    odomAftMapped.twist.twist.linear.z = velocity_body.z();
+    
+    Eigen::Vector3d angular_velocity_body =
+        Eigen::Vector3d::Zero();
+    
+    if (!Measures.imu.empty())
+    {
+        const auto &imu = Measures.imu.back();
+
+        angular_velocity_body.x() =
+            imu->angular_velocity.x - state_point.bg(0);
+
+        angular_velocity_body.y() =
+            imu->angular_velocity.y - state_point.bg(1);
+
+        angular_velocity_body.z() =
+            imu->angular_velocity.z - state_point.bg(2);
+    }
+    
+    odomAftMapped.twist.twist.angular.x =
+        angular_velocity_body.x();
+
+    odomAftMapped.twist.twist.angular.y =
+        angular_velocity_body.y();
+
+    odomAftMapped.twist.twist.angular.z =
+        angular_velocity_body.z();
+    
+    // Pose covariance
+    const auto P = kf.get_P();
+    
     for (int i = 0; i < 6; i ++)
     {
-        int k = i < 3 ? i + 3 : i - 3;
+        const int k = (i < 3) ? i + 3 : i - 3;
         odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
         odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
         odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
@@ -643,11 +693,15 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
+    
+    trans.header.frame_id = world_frame;
     trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = "body";
+    trans.child_frame_id = body_frame;
+    
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -658,11 +712,144 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     tf_br->sendTransform(trans);
 }
 
+void publish_nav_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav)
+{
+    odomNav = nav_msgs::msg::Odometry();
+    
+    odomNav.header.frame_id = world_frame;
+    odomNav.child_frame_id = "base_link";
+    odomNav.header.stamp = get_ros_time(lidar_end_time);
+    
+    /*
+     * state_point.rot:
+     * body座標系からodom座標系への回転
+     */
+    const Eigen::Matrix3d rotation_odom_body =
+    	state_point.rot.toRotationMatrix();
+    
+    /*
+     * body -> base_link
+     *
+     * 現在の静的TF：
+     * translation = [0, 0, 0]
+     * yaw = pi
+     */
+    constexpr double body_to_base_yaw = 0.0;
+    	
+    const Eigen::Matrix3d rotation_body_base =
+        Eigen::AngleAxisd(
+            body_to_base_yaw,
+            Eigen::Vector3d::UnitZ())
+            .toRotationMatrix();
+    
+    /*
+     * T_odom_base =
+     * T_odom_body * T_body_base
+     */
+    const Eigen::Matrix3d rotation_odom_base =
+        rotation_odom_body * rotation_body_base;
+        
+    Eigen::Quaterniond quaternion_odom_base(
+        rotation_odom_base);
+
+    quaternion_odom_base.normalize();
+    
+    /*
+     * 現在はbodyとbase_linkの原点が一致すると仮定しているため，
+     * 位置はstate_point.posと同じ．
+     */
+    odomNav.pose.pose.position.x = state_point.pos(0);
+    odomNav.pose.pose.position.y = state_point.pos(1);
+    odomNav.pose.pose.position.z = state_point.pos(2);
+    odomNav.pose.pose.orientation.x = quaternion_odom_base.x();
+    odomNav.pose.pose.orientation.y = quaternion_odom_base.y();
+    odomNav.pose.pose.orientation.z = quaternion_odom_base.z();
+    odomNav.pose.pose.orientation.w = quaternion_odom_base.w();
+    
+    /*
+     * state_point.velはodom座標系で表現された
+     * body原点の速度．
+     */
+    const Eigen::Vector3d velocity_odom(
+        state_point.vel(0),
+        state_point.vel(1),
+        state_point.vel(2));
+    
+    /*
+     * odom座標系 -> body座標系
+     */
+    const Eigen::Vector3d velocity_body =
+        rotation_odom_body.transpose() * velocity_odom;
+        
+    /*
+     * body座標系 -> base_link座標系
+     */
+    const Eigen::Vector3d velocity_base =
+        rotation_body_base.transpose() * velocity_body;
+        
+    odomNav.twist.twist.linear.x = velocity_base.x();
+    odomNav.twist.twist.linear.y = velocity_base.y();
+    odomNav.twist.twist.linear.z = velocity_base.z();
+    
+    /*
+     * 最新IMU角速度から推定ジャイロバイアスを除去する．
+     * IMUメッセージとFAST-LIO2のbody座標系が
+     * 同じ軸定義であることを前提とする．
+     */
+    Eigen::Vector3d angular_velocity_body =
+        Eigen::Vector3d::Zero();
+    
+    if (!Measures.imu.empty())
+    {
+        const auto &imu = Measures.imu.back();
+
+        angular_velocity_body.x() =
+            imu->angular_velocity.x - state_point.bg(0);
+
+        angular_velocity_body.y() =
+            imu->angular_velocity.y - state_point.bg(1);
+
+        angular_velocity_body.z() =
+            imu->angular_velocity.z - state_point.bg(2);
+    }
+    
+    /*
+     * body座標系 -> base_link座標系
+     */
+    const Eigen::Vector3d angular_velocity_base =
+        rotation_body_base.transpose()
+        * angular_velocity_body;
+    
+    odomNav.twist.twist.angular.x = angular_velocity_base.x();
+    odomNav.twist.twist.angular.y = angular_velocity_base.y();
+    odomNav.twist.twist.angular.z = angular_velocity_base.z();
+    
+    /*
+     * Nav2 Controllerは主にtwistを使用する．
+     * 初期試験ではpose covarianceをコピーする．
+     */
+    odomNav.pose.covariance = odomAftMapped.pose.covariance;
+    
+    /*
+     * Twist covarianceは現状FAST-LIO2から取得できないため，
+     * 初期値として対角成分を設定する．
+     */
+    odomNav.twist.covariance.fill(0.0);
+    odomNav.twist.covariance[0] = 0.05 * 0.05;
+    odomNav.twist.covariance[7] = 0.05 * 0.05;
+    odomNav.twist.covariance[14] = 0.10 * 0.10;
+    odomNav.twist.covariance[21] = 0.10 * 0.10;
+    odomNav.twist.covariance[28] = 0.10 * 0.10;
+    odomNav.twist.covariance[35] = 0.05 * 0.05;
+    
+    pubOdomNav->publish(odomNav);
+}
+
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.frame_id = world_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -806,6 +993,8 @@ public:
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
+        this->declare_parameter<string>("frames.world_frame", "odom");
+	this->declare_parameter<string>("frames.body_frame", "body");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
@@ -842,6 +1031,8 @@ public:
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
+        this->get_parameter_or<string>("frames.world_frame", world_frame, "odom");
+        this->get_parameter_or<string>("frames.body_frame", body_frame, "body");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
@@ -873,7 +1064,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
+        path.header.frame_id = world_frame;
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -926,12 +1117,17 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+        	imu_topic,
+        	rclcpp::SensorDataQoS(),
+        	imu_cbk
+        );
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubOdomNav_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom_nav", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -1062,6 +1258,7 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_nav_odometry(pubOdomNav_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1070,7 +1267,7 @@ private:
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
+            if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
@@ -1134,6 +1331,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
@@ -1167,13 +1365,41 @@ int main(int argc, char** argv)
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
+    if (!pcl_wait_save->empty() && pcd_save_en)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+    	const string pcd_dir =
+        	string(ROOT_DIR) + "PCD/";
+
+    	// PCDディレクトリがなければ作成
+    	mkdir(pcd_dir.c_str(), 0755);
+
+    	const string all_points_dir =
+        	pcd_dir + "scans.pcd";
+
+    	pcl::PCDWriter pcd_writer;
+    	const int result =
+        	pcd_writer.writeBinary(
+            		all_points_dir,
+            		*pcl_wait_save);
+
+    	if (result == 0)
+    	{
+        	cout << "current scan saved to "
+             	     << all_points_dir << endl;
+    	}
+    	else
+    	{
+        	cerr << "failed to save PCD: "
+        	     << all_points_dir
+             	     << " (error=" << result << ")"
+             	     << endl;
+    	}
+    }
+    else if (pcd_save_en)
+    {
+    	cerr << "PCD save skipped: "
+             << "pcl_wait_save is empty."
+             << endl;
     }
 
     if (runtime_pos_log)
