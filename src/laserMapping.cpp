@@ -57,12 +57,6 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include <tf2/time.h>
-#include <tf2/exceptions.h>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/transform_broadcaster.h>
-#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
@@ -146,7 +140,6 @@ vect3 pos_lid;
 
 nav_msgs::msg::Path path;
 nav_msgs::msg::Odometry odomAftMapped;
-nav_msgs::msg::Odometry odomNav;
 geometry_msgs::msg::Quaternion geoQuat;
 geometry_msgs::msg::PoseStamped msg_body_pose;
 
@@ -633,7 +626,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br, bool publish_tf)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped)
 {
     odomAftMapped = nav_msgs::msg::Odometry();
     
@@ -699,98 +692,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
     
     pubOdomAftMapped->publish(odomAftMapped);
-
-    if (!publish_tf) return;
-
-    geometry_msgs::msg::TransformStamped trans;
-    
-    trans.header.frame_id = world_frame;
-    trans.header.stamp = odomAftMapped.header.stamp;
-    trans.child_frame_id = body_frame;
-    
-    trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
-    trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
-    trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
-    trans.transform.rotation.w = odomAftMapped.pose.pose.orientation.w;
-    trans.transform.rotation.x = odomAftMapped.pose.pose.orientation.x;
-    trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
-    trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
-    tf_br->sendTransform(trans);
-}
-
-void publish_nav_odometry(
-    const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav,
-    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
-    const geometry_msgs::msg::TransformStamped &imu_from_base)
-{
-    // /Odometry: odom基準のIMU位置姿勢
-    const auto &pose = odomAftMapped.pose.pose;
-    const auto &twist = odomAftMapped.twist.twist;
-    const auto &tf = imu_from_base.transform;
-
-    const Eigen::Vector3d p_odom_imu(pose.position.x, pose.position.y, pose.position.z);
-    Eigen::Quaterniond q_odom_imu(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
-
-    // T_imu_base: IMU座標系から見たbase_linkの位置姿勢
-    const Eigen::Vector3d p_imu_base(tf.translation.x, tf.translation.y, tf.translation.z);
-    Eigen::Quaterniond q_imu_base(tf.rotation.w, tf.rotation.x, tf.rotation.y, tf.rotation.z);
-
-    q_odom_imu.normalize();
-    q_imu_base.normalize();
-
-    // T_odom_base = T_odom_imu * T_imu_base
-    const Eigen::Vector3d p_odom_base = p_odom_imu + q_odom_imu * p_imu_base;
-    const Eigen::Quaterniond q_odom_base = (q_odom_imu * q_imu_base).normalized();
-
-    // IMU基準の並進速度・角速度
-    const Eigen::Vector3d v_imu(twist.linear.x, twist.linear.y, twist.linear.z);
-    const Eigen::Vector3d w_imu(twist.angular.x, twist.angular.y, twist.angular.z);
-
-    // 回転中心の違いを含めてbase_link基準へ変換
-    const Eigen::Matrix3d R_base_imu = q_imu_base.toRotationMatrix().transpose();
-    const Eigen::Vector3d v_base = R_base_imu * (v_imu + w_imu.cross(p_imu_base));
-    const Eigen::Vector3d w_base = R_base_imu * w_imu;
-
-    // Nav2用オドメトリ
-    odomNav = odomAftMapped;
-    odomNav.child_frame_id = "base_link";
-
-    odomNav.pose.pose.position.x = p_odom_base.x();
-    odomNav.pose.pose.position.y = p_odom_base.y();
-    odomNav.pose.pose.position.z = p_odom_base.z();
-    odomNav.pose.pose.orientation.x = q_odom_base.x();
-    odomNav.pose.pose.orientation.y = q_odom_base.y();
-    odomNav.pose.pose.orientation.z = q_odom_base.z();
-    odomNav.pose.pose.orientation.w = q_odom_base.w();
-
-    odomNav.twist.twist.linear.x = v_base.x();
-    odomNav.twist.twist.linear.y = v_base.y();
-    odomNav.twist.twist.linear.z = v_base.z();
-    odomNav.twist.twist.angular.x = w_base.x();
-    odomNav.twist.twist.angular.y = w_base.y();
-    odomNav.twist.twist.angular.z = w_base.z();
-
-    // 暫定的な共分散設定。厳密な変換は別途必要。
-    odomNav.pose.covariance = odomAftMapped.pose.covariance;
-    odomNav.twist.covariance.fill(0.0);
-    odomNav.twist.covariance[0] = 0.05 * 0.05;
-    odomNav.twist.covariance[7] = 0.05 * 0.05;
-    odomNav.twist.covariance[14] = 0.10 * 0.10;
-    odomNav.twist.covariance[21] = 0.10 * 0.10;
-    odomNav.twist.covariance[28] = 0.10 * 0.10;
-    odomNav.twist.covariance[35] = 0.05 * 0.05;
-
-    pubOdomNav->publish(odomNav);
-
-    // Nav2用の動的TF: odom -> base_link
-    geometry_msgs::msg::TransformStamped trans;
-    trans.header = odomNav.header;
-    trans.child_frame_id = "base_link";
-    trans.transform.translation.x = p_odom_base.x();
-    trans.transform.translation.y = p_odom_base.y();
-    trans.transform.translation.z = p_odom_base.z();
-    trans.transform.rotation = odomNav.pose.pose.orientation;
-    tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -939,7 +840,6 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
-        this->declare_parameter<bool>("publish.nav2_tf_en", false);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("frames.world_frame", "odom");
@@ -978,7 +878,6 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
-        this->get_parameter_or<bool>("publish.nav2_tf_en", nav2_tf_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("frames.world_frame", world_frame, "odom");
@@ -1077,15 +976,7 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
-        pubOdomNav_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom_nav", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
-        tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-        if (nav2_tf_en)
-        {
-            tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-        }
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1213,34 +1104,7 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_, !nav2_tf_en);
-
-            if (nav2_tf_en)
-            {
-                if (!imu_base_tf_ready)
-                {
-                    try
-                    {
-                        imu_from_base_ = tf_buffer_->lookupTransform(body_frame, "base_link", tf2::TimePointZero);
-
-                        imu_base_tf_ready = true;
-                        RCLCPP_INFO(
-                            this->get_logger(),
-                            "TF acquired: %s <- base_link", body_frame.c_str());
-                    }
-                    catch (const tf2::TransformException &ex)
-                    {
-                        RCLCPP_WARN_THROTTLE(
-                            this->get_logger(), *this->get_clock(), 5000,
-                            "Waiting for IMU/base_link static TF: %s", ex.what());
-                    }
-                }
-
-                if (imu_base_tf_ready)
-                {
-                    publish_nav_odometry(pubOdomNav_, tf_broadcaster_, imu_from_base_);
-                }
-            }
+            publish_odometry(pubOdomAftMapped_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1313,23 +1177,14 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
-    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
-    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
-
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-    geometry_msgs::msg::TransformStamped imu_from_base_;
-
-    bool nav2_tf_en = false;
-    bool imu_base_tf_ready = false;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
