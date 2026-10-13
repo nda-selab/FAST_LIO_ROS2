@@ -9,6 +9,10 @@
         runtime_pos_log_enable: false
         map_file_path: "./test.pcd"
 
+        frames:
+            world_frame: "odom"
+            body_frame: "base_link"
+
         common:
             lid_topic:  "/ouster/points"
             imu_topic:  "/ouster/imu"
@@ -40,10 +44,10 @@
         publish:
             path_en: true
             scan_publish_en:  true       # false: close all the point cloud output
-            dense_publish_en: false       # false: low down the points number in a global-frame point clouds scan.
-            scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
+            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            scan_bodyframe_pub_en: false # true: output the point cloud scans in IMU-body-frame
 
         pcd_save:
             pcd_save_en: false
-            interval: 100                 # how many LiDAR frames saved in each pcd file; 
-                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+            interval: 100       # how many LiDAR frames saved in each pcd file; 
+                                # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
