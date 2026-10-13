@@ -31,7 +31,7 @@ def generate_launch_description():
         description='Yaml config file path'
     )
     declare_config_file_cmd = DeclareLaunchArgument(
-        'config_file', default_value='ouster64_outdoor.yaml',
+        'config_file', default_value='os2_64.yaml',
         description='Config file'
     )
     declare_rviz_cmd = DeclareLaunchArgument(
