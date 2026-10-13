@@ -57,6 +57,10 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <tf2/time.h>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
@@ -629,7 +633,7 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br, bool publish_tf)
 {
     odomAftMapped = nav_msgs::msg::Odometry();
     
@@ -696,6 +700,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     
     pubOdomAftMapped->publish(odomAftMapped);
 
+    if (!publish_tf) return;
+
     geometry_msgs::msg::TransformStamped trans;
     
     trans.header.frame_id = world_frame;
@@ -712,128 +718,60 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     tf_br->sendTransform(trans);
 }
 
-void publish_nav_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav)
+void publish_nav_odometry(
+    const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomNav,
+    std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
+    const geometry_msgs::msg::TransformStamped &imu_from_base)
 {
-    odomNav = nav_msgs::msg::Odometry();
-    
-    odomNav.header.frame_id = world_frame;
+    // /Odometry: odom基準のIMU位置姿勢
+    const auto &pose = odomAftMapped.pose.pose;
+    const auto &twist = odomAftMapped.twist.twist;
+    const auto &tf = imu_from_base.transform;
+
+    const Eigen::Vector3d p_odom_imu(pose.position.x, pose.position.y, pose.position.z);
+    Eigen::Quaterniond q_odom_imu(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+
+    // T_imu_base: IMU座標系から見たbase_linkの位置姿勢
+    const Eigen::Vector3d p_imu_base(tf.translation.x, tf.translation.y, tf.translation.z);
+    Eigen::Quaterniond q_imu_base(tf.rotation.w, tf.rotation.x, tf.rotation.y, tf.rotation.z);
+
+    q_odom_imu.normalize();
+    q_imu_base.normalize();
+
+    // T_odom_base = T_odom_imu * T_imu_base
+    const Eigen::Vector3d p_odom_base = p_odom_imu + q_odom_imu * p_imu_base;
+    const Eigen::Quaterniond q_odom_base = (q_odom_imu * q_imu_base).normalized();
+
+    // IMU基準の並進速度・角速度
+    const Eigen::Vector3d v_imu(twist.linear.x, twist.linear.y, twist.linear.z);
+    const Eigen::Vector3d w_imu(twist.angular.x, twist.angular.y, twist.angular.z);
+
+    // 回転中心の違いを含めてbase_link基準へ変換
+    const Eigen::Matrix3d R_base_imu = q_imu_base.toRotationMatrix().transpose();
+    const Eigen::Vector3d v_base = R_base_imu * (v_imu + w_imu.cross(p_imu_base));
+    const Eigen::Vector3d w_base = R_base_imu * w_imu;
+
+    // Nav2用オドメトリ
+    odomNav = odomAftMapped;
     odomNav.child_frame_id = "base_link";
-    odomNav.header.stamp = get_ros_time(lidar_end_time);
-    
-    /*
-     * state_point.rot:
-     * body座標系からodom座標系への回転
-     */
-    const Eigen::Matrix3d rotation_odom_body =
-    	state_point.rot.toRotationMatrix();
-    
-    /*
-     * body -> base_link
-     *
-     * 現在の静的TF：
-     * translation = [0, 0, 0]
-     * yaw = pi
-     */
-    constexpr double body_to_base_yaw = 0.0;
-    	
-    const Eigen::Matrix3d rotation_body_base =
-        Eigen::AngleAxisd(
-            body_to_base_yaw,
-            Eigen::Vector3d::UnitZ())
-            .toRotationMatrix();
-    
-    /*
-     * T_odom_base =
-     * T_odom_body * T_body_base
-     */
-    const Eigen::Matrix3d rotation_odom_base =
-        rotation_odom_body * rotation_body_base;
-        
-    Eigen::Quaterniond quaternion_odom_base(
-        rotation_odom_base);
 
-    quaternion_odom_base.normalize();
-    
-    /*
-     * 現在はbodyとbase_linkの原点が一致すると仮定しているため，
-     * 位置はstate_point.posと同じ．
-     */
-    odomNav.pose.pose.position.x = state_point.pos(0);
-    odomNav.pose.pose.position.y = state_point.pos(1);
-    odomNav.pose.pose.position.z = state_point.pos(2);
-    odomNav.pose.pose.orientation.x = quaternion_odom_base.x();
-    odomNav.pose.pose.orientation.y = quaternion_odom_base.y();
-    odomNav.pose.pose.orientation.z = quaternion_odom_base.z();
-    odomNav.pose.pose.orientation.w = quaternion_odom_base.w();
-    
-    /*
-     * state_point.velはodom座標系で表現された
-     * body原点の速度．
-     */
-    const Eigen::Vector3d velocity_odom(
-        state_point.vel(0),
-        state_point.vel(1),
-        state_point.vel(2));
-    
-    /*
-     * odom座標系 -> body座標系
-     */
-    const Eigen::Vector3d velocity_body =
-        rotation_odom_body.transpose() * velocity_odom;
-        
-    /*
-     * body座標系 -> base_link座標系
-     */
-    const Eigen::Vector3d velocity_base =
-        rotation_body_base.transpose() * velocity_body;
-        
-    odomNav.twist.twist.linear.x = velocity_base.x();
-    odomNav.twist.twist.linear.y = velocity_base.y();
-    odomNav.twist.twist.linear.z = velocity_base.z();
-    
-    /*
-     * 最新IMU角速度から推定ジャイロバイアスを除去する．
-     * IMUメッセージとFAST-LIO2のbody座標系が
-     * 同じ軸定義であることを前提とする．
-     */
-    Eigen::Vector3d angular_velocity_body =
-        Eigen::Vector3d::Zero();
-    
-    if (!Measures.imu.empty())
-    {
-        const auto &imu = Measures.imu.back();
+    odomNav.pose.pose.position.x = p_odom_base.x();
+    odomNav.pose.pose.position.y = p_odom_base.y();
+    odomNav.pose.pose.position.z = p_odom_base.z();
+    odomNav.pose.pose.orientation.x = q_odom_base.x();
+    odomNav.pose.pose.orientation.y = q_odom_base.y();
+    odomNav.pose.pose.orientation.z = q_odom_base.z();
+    odomNav.pose.pose.orientation.w = q_odom_base.w();
 
-        angular_velocity_body.x() =
-            imu->angular_velocity.x - state_point.bg(0);
+    odomNav.twist.twist.linear.x = v_base.x();
+    odomNav.twist.twist.linear.y = v_base.y();
+    odomNav.twist.twist.linear.z = v_base.z();
+    odomNav.twist.twist.angular.x = w_base.x();
+    odomNav.twist.twist.angular.y = w_base.y();
+    odomNav.twist.twist.angular.z = w_base.z();
 
-        angular_velocity_body.y() =
-            imu->angular_velocity.y - state_point.bg(1);
-
-        angular_velocity_body.z() =
-            imu->angular_velocity.z - state_point.bg(2);
-    }
-    
-    /*
-     * body座標系 -> base_link座標系
-     */
-    const Eigen::Vector3d angular_velocity_base =
-        rotation_body_base.transpose()
-        * angular_velocity_body;
-    
-    odomNav.twist.twist.angular.x = angular_velocity_base.x();
-    odomNav.twist.twist.angular.y = angular_velocity_base.y();
-    odomNav.twist.twist.angular.z = angular_velocity_base.z();
-    
-    /*
-     * Nav2 Controllerは主にtwistを使用する．
-     * 初期試験ではpose covarianceをコピーする．
-     */
+    // 暫定的な共分散設定。厳密な変換は別途必要。
     odomNav.pose.covariance = odomAftMapped.pose.covariance;
-    
-    /*
-     * Twist covarianceは現状FAST-LIO2から取得できないため，
-     * 初期値として対角成分を設定する．
-     */
     odomNav.twist.covariance.fill(0.0);
     odomNav.twist.covariance[0] = 0.05 * 0.05;
     odomNav.twist.covariance[7] = 0.05 * 0.05;
@@ -841,8 +779,18 @@ void publish_nav_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::Shar
     odomNav.twist.covariance[21] = 0.10 * 0.10;
     odomNav.twist.covariance[28] = 0.10 * 0.10;
     odomNav.twist.covariance[35] = 0.05 * 0.05;
-    
+
     pubOdomNav->publish(odomNav);
+
+    // Nav2用の動的TF: odom -> base_link
+    geometry_msgs::msg::TransformStamped trans;
+    trans.header = odomNav.header;
+    trans.child_frame_id = "base_link";
+    trans.transform.translation.x = p_odom_base.x();
+    trans.transform.translation.y = p_odom_base.y();
+    trans.transform.translation.z = p_odom_base.z();
+    trans.transform.rotation = odomNav.pose.pose.orientation;
+    tf_br->sendTransform(trans);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -991,10 +939,11 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<bool>("publish.nav2_tf_en", false);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("frames.world_frame", "odom");
-	this->declare_parameter<string>("frames.body_frame", "body");
+	    this->declare_parameter<string>("frames.body_frame", "body");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
@@ -1029,6 +978,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<bool>("publish.nav2_tf_en", nav2_tf_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("frames.world_frame", world_frame, "odom");
@@ -1130,6 +1080,12 @@ public:
         pubOdomNav_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom_nav", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+        if (nav2_tf_en)
+        {
+            tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        }
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1257,8 +1213,34 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-            publish_nav_odometry(pubOdomNav_);
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_, !nav2_tf_en);
+
+            if (nav2_tf_en)
+            {
+                if (!imu_base_tf_ready)
+                {
+                    try
+                    {
+                        imu_from_base_ = tf_buffer_->lookupTransform(body_frame, "base_link", tf2::TimePointZero);
+
+                        imu_base_tf_ready = true;
+                        RCLCPP_INFO(
+                            this->get_logger(),
+                            "TF acquired: %s <- base_link", body_frame.c_str());
+                    }
+                    catch (const tf2::TransformException &ex)
+                    {
+                        RCLCPP_WARN_THROTTLE(
+                            this->get_logger(), *this->get_clock(), 5000,
+                            "Waiting for IMU/base_link static TF: %s", ex.what());
+                    }
+                }
+
+                if (imu_base_tf_ready)
+                {
+                    publish_nav_odometry(pubOdomNav_, tf_broadcaster_, imu_from_base_);
+                }
+            }
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1341,6 +1323,13 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    geometry_msgs::msg::TransformStamped imu_from_base_;
+
+    bool nav2_tf_en = false;
+    bool imu_base_tf_ready = false;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
